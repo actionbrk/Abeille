@@ -19,6 +19,9 @@ from cogs.tracking import get_tracking_cog
 from common.checks import Maintenance
 from common.utils import emoji_to_str, str_input_ok
 from models.message import Message
+from discord_slash import cog_ext, SlashContext
+from discord_slash.utils.manage_commands import create_option, create_choice
+from cogs.misc import guild_ids
 
 PERIODE = 1100
 ROLLING_AVERAGE = 14
@@ -283,12 +286,114 @@ class Activity(commands.Cog):
 
         return chart_id
 
+    @cog_ext.cog_slash(
+        name="trend",
+        description="Dessiner la tendance d'une expression.",
+        guild_ids=guild_ids,
+        options=[
+            create_option(
+                name="terme",
+                description="Saisissez un mot ou une phrase.",
+                option_type=3,
+                required=True,
+            ),
+            create_option(
+                name="periode",
+                description="Période de temps max sur laquelle dessiner la tendance.",
+                option_type=3,
+                required=True,
+                choices=[
+                    create_choice(name="6 mois", value="182"),
+                    create_choice(name="1 an", value="365"),
+                    create_choice(name="2 ans", value="730"),
+                    create_choice(name="3 ans", value="1096"),
+                ],
+            ),
+        ],
+    )
+    async def trend_slash(self, ctx: SlashContext, terme: str, periode: str):
+        await ctx.defer()
+        guild_id = ctx.guild.id
+        jour_debut = date.today() - timedelta(days=int(periode))
+        jour_fin = date.today() - timedelta(days=1)
+        tracking_cog = get_tracking_cog(self.bot)
+        db = tracking_cog.tracked_guilds[guild_id]
+        guild_name = self.bot.get_guild(guild_id)
+
+        with db:
+            with db.bind_ctx([Message]):
+                # Messages de l'utilisateur dans la période
+                query = (
+                    Message.select(
+                        fn.DATE(Message.timestamp).alias("date"),
+                        (
+                            fn.SUM(Message.content.contains(terme))
+                            / fn.COUNT(Message.message_id)
+                        ).alias("messages"),
+                    )
+                    .where(fn.DATE(Message.timestamp) >= jour_debut)
+                    .where(fn.DATE(Message.timestamp) <= jour_fin)
+                    .group_by(fn.DATE(Message.timestamp))
+                )
+
+                # Exécution requête SQL
+                cur = db.cursor()
+                query_sql = cur.mogrify(*query.sql())
+                df = pandas.read_sql(query_sql, db.connection())
+
+        # Remplir les dates manquantes
+        df = df.set_index("date")
+        df.index = pandas.DatetimeIndex(df.index)
+        df.reset_index(level=0, inplace=True)
+        df = df.rename(columns={"index": "date"})
+
+        # Rolling average
+        df["messages"] = df.rolling(ROLLING_AVERAGE).mean()
+
+        # Si emote custom : simplifier le nom pour titre DW
+        custom_emoji_str = emoji_to_str(terme)
+        if custom_emoji_str:
+            terme = custom_emoji_str
+
+        title_lines = textwrap.wrap(f"Tendances de <b>'{terme}'</b>")
+        title_lines.append(f"<i style='font-size: 10px'>Sur {guild_name}.</i>")
+        title = "<br>".join(title_lines)
+        fig: go.Figure = px.area(
+            df,
+            x="date",
+            y="messages",
+            color_discrete_sequence=["yellow"],
+            # line_shape="spline",
+            template="plotly_dark",
+            title=title,
+            labels={"date": "", "messages": ""},
+        )
+        fig.add_layout_image(
+            dict(
+                source="https://i.imgur.com/Eqy58rg.png",
+                xref="paper",
+                yref="paper",
+                x=1.1,
+                y=-0.22,
+                sizex=0.25,
+                sizey=0.25,
+                xanchor="right",
+                yanchor="bottom",
+                opacity=0.8,
+            )
+        )
+
+        img = fig.to_image(format="png", scale=2)
+
+        # Envoyer image
+        await ctx.send(file=discord.File(io.BytesIO(img), "abeille.png"))
+
     @commands.command(name="trend", aliases=["trendbeta"])
     @commands.max_concurrency(1, wait=True)
     @commands.guild_only()
     async def trend(self, ctx: commands.Context, *, terme: str):
         assert ctx.guild is not None, "Impossible de récupérer la guild"
-        await self._trend(ctx, ctx.guild.id, terme)
+        await ctx.reply("Utilisez la nouvelle commande slash ! `/trend` 🐝")
 
     @commands.command(name="trendid")
     @commands.max_concurrency(1, wait=True)
